@@ -10,7 +10,9 @@ from flask import Flask, Response, redirect, render_template_string, request, ur
 
 from swv_core import (
     FIXED_DERIV_SMOOTH_WIN,
+    FIXED_OUTER_REF_SMOOTH_SIGMA,
     FIXED_SMOOTH_SIGMA,
+    POLY_DEGREE_OPTIONS,
     build_output_dataframe,
     figure_to_png_bytes,
     format_polynomial,
@@ -226,7 +228,7 @@ TEMPLATE = """
     <section class="hero">
       <h1>SWV Peak Baseline Correction Tool</h1>
       <p>Self-contained local web app for the existing SWV workflow. Upload CSV or Excel, choose the potential/current columns, choose the peak orientation, define the desired peak bounds from the raw data, and export the corrected dataset without Streamlit.</p>
-      <p class="hint">Fixed smoothing sigma: <strong>{{ fixed_sigma }}</strong> | Fixed detrended smoothing window: <strong>{{ fixed_deriv_win }}</strong></p>
+      <p class="hint">Fixed peak-finding smoothing sigma: <strong>{{ fixed_sigma }}</strong> | Default outer-reference smoothing sigma: <strong>{{ fixed_outer_sigma }}</strong> | Fixed detrended smoothing window: <strong>{{ fixed_deriv_win }}</strong></p>
     </section>
 
     <div class="grid">
@@ -279,11 +281,18 @@ TEMPLATE = """
             <div>
               <label for="poly_degree">Zero-line polynomial degree</label>
               <select id="poly_degree" name="poly_degree">
-                {% for degree in [1, 2, 3] %}
-                  <option value="{{ degree }}" {% if form.poly_degree|int == degree %}selected{% endif %}>{{ degree }}</option>
+                <option value="auto" {% if form.poly_degree == "auto" %}selected{% endif %}>Auto (best R²)</option>
+                {% for degree in poly_degree_options %}
+                  <option value="{{ degree }}" {% if form.poly_degree == degree|string %}selected{% endif %}>{{ degree }}</option>
                 {% endfor %}
               </select>
             </div>
+            <div>
+              <label for="outer_smooth_sigma">Outer smoothing sigma</label>
+              <input id="outer_smooth_sigma" type="number" min="0.5" max="10" step="0.5" name="outer_smooth_sigma" value="{{ form.outer_smooth_sigma }}">
+            </div>
+          </div>
+          <div class="two-col">
             <div>
               <label for="manual_eps">Manual safety margin ε</label>
               <input id="manual_eps" type="number" min="0" step="0.0000001" name="manual_eps" value="{{ form.manual_eps }}">
@@ -335,7 +344,9 @@ TEMPLATE = """
               <div class="metric"><div class="k">Right Boundary</div><div class="v">{{ result.right_boundary }}</div></div>
               <div class="metric"><div class="k">Requested Window</div><div class="v">{{ result.requested_window }}</div></div>
               <div class="metric"><div class="k">Peak Orientation</div><div class="v">{{ result.peak_orientation }}</div></div>
-              <div class="metric"><div class="k">Min Gap</div><div class="v">{{ result.min_gap }}</div></div>
+              <div class="metric"><div class="k">Peak-Window Min Gap</div><div class="v">{{ result.min_guard_gap }}</div></div>
+              <div class="metric"><div class="k">Outer Min Gap</div><div class="v">{{ result.min_outer_gap }}</div></div>
+              <div class="metric"><div class="k">Outer Mean |Zero Error|</div><div class="v">{{ result.outer_mean_abs_error }}</div></div>
               <div class="metric"><div class="k">Safety Margin ε</div><div class="v">{{ result.eps }}</div></div>
               <div class="metric"><div class="k">No Cross</div><div class="v">{{ result.no_cross }}</div></div>
               <div class="metric"><div class="k">No Touch</div><div class="v">{{ result.no_touch }}</div></div>
@@ -362,6 +373,11 @@ TEMPLATE = """
             <p><strong>Rough apex-detection reference line:</strong> <code>y = {{ result.rough_line }}</code></p>
             <p><strong>Max orthogonal distance:</strong> <code>{{ result.apex_distance }}</code></p>
             <p><strong>Polynomial degree:</strong> <code>{{ result.poly_degree }}</code></p>
+            <p><strong>Selected degree R²:</strong> <code>{{ result.selected_degree_r2 }}</code></p>
+            <p><strong>Best auto degree:</strong> <code>{{ result.best_degree }}</code></p>
+            <p><strong>Best auto degree R²:</strong> <code>{{ result.best_degree_r2 }}</code></p>
+            <p><strong>Outer-point smoothing:</strong> <code>Only points outside the selected peak window are smoothed (sigma = {{ result.outer_smooth_sigma }})</code></p>
+            <p><strong>Zeroing target:</strong> <code>The final re-zeroed curve uses the smoothed signal, not the raw signal. Outer regions are kept near zero; the final protective shift is enforced against the selected peak window only.</code></p>
             <p><strong>Polynomial coefficients:</strong> <code>{{ result.coefficients }}</code></p>
             <p><strong>Polynomial expression:</strong> <code>{{ result.polynomial_expression }}</code></p>
             <p><strong>Vertical shift applied:</strong> <code>{{ result.delta_shift }}</code></p>
@@ -380,8 +396,8 @@ TEMPLATE = """
             <p>3. Fit a rough upper or lower reference line inside that window based on the selected peak orientation.</p>
             <p>4. Pick the apex by maximum orthogonal distance away from that reference line.</p>
             <p>5. Fit a polynomial zero line using points outside the selected peak window.</p>
-            <p>6. Shift the polynomial toward the non-peak side to satisfy no-cross and no-touch.</p>
-            <p>8. Export the zero-line-relative corrected curve.</p>
+            <p>6. Keep the outer regions close to zero, and apply any final protective shift only to guard the selected peak window.</p>
+            <p>8. Export the zero-line-relative corrected curve computed from the smoothed signal.</p>
           </section>
         {% endif %}
       </main>
@@ -548,7 +564,8 @@ def _default_form_state():
         "peak_orientation": "downward",
         "peak_left_bound": "",
         "peak_right_bound": "",
-        "poly_degree": "2",
+        "poly_degree": "auto",
+        "outer_smooth_sigma": str(FIXED_OUTER_REF_SMOOTH_SIGMA),
         "auto_eps": True,
         "manual_eps": "1e-6",
         "sort_x": True,
@@ -637,6 +654,7 @@ def index():
                 "peak_left_bound": request.form.get("peak_left_bound", form["peak_left_bound"]),
                 "peak_right_bound": request.form.get("peak_right_bound", form["peak_right_bound"]),
                 "poly_degree": request.form.get("poly_degree", form["poly_degree"]),
+                "outer_smooth_sigma": request.form.get("outer_smooth_sigma", form["outer_smooth_sigma"]),
                 "manual_eps": request.form.get("manual_eps", form["manual_eps"]),
                 "auto_eps": _bool_field("auto_eps"),
                 "sort_x": _bool_field("sort_x"),
@@ -688,7 +706,8 @@ def index():
 
                 peak_left_bound = float(form["peak_left_bound"])
                 peak_right_bound = float(form["peak_right_bound"])
-                poly_degree = int(form["poly_degree"])
+                poly_degree = form["poly_degree"]
+                outer_smooth_sigma = float(form["outer_smooth_sigma"])
                 eps = None if form["auto_eps"] else float(form["manual_eps"])
 
                 result = swv_workflow(
@@ -699,6 +718,7 @@ def index():
                     peak_orientation=form["peak_orientation"],
                     eps=eps,
                     poly_degree=poly_degree,
+                    outer_smooth_sigma=outer_smooth_sigma,
                 )
 
                 out_df = build_output_dataframe(result)
@@ -733,6 +753,7 @@ def index():
                             make_plot_zero_line(
                                 E,
                                 I,
+                                result["I_outer_smoothed"],
                                 result["zero_line_fit_curve"],
                                 result["zero_line"],
                                 result["ref_mask"],
@@ -741,12 +762,12 @@ def index():
                                 result["right_idx"],
                             )
                         ),
-                        "note": None,
+                        "note": "Only the outer reference regions are smoothed before the polynomial fit; the selected peak window is preserved raw.",
                     },
                     {
                         "title": "4. Relative Curve",
                         "image": _encode_plot(make_plot_corrected(E, result["corrected"], result["left_idx"], result["right_idx"])),
-                        "note": None,
+                        "note": "The final re-zeroed curve is computed from the smoothed signal rather than the raw current trace.",
                     },
                 ]
 
@@ -757,12 +778,19 @@ def index():
                     "requested_window": f"{result['requested_left_bound']:.5f} to {result['requested_right_bound']:.5f}",
                     "peak_orientation": "Concaving up / pointing downward" if result["peak_orientation"] == "downward" else "Concaving down / pointing upward",
                     "min_gap": f"{result['min_gap']:.5e}",
+                    "min_guard_gap": f"{result['min_guard_gap']:.5e}",
+                    "min_outer_gap": f"{result['min_outer_gap']:.5e}",
+                    "outer_mean_abs_error": f"{result['outer_mean_abs_error'] * 1e6:.5f} uA",
                     "eps": f"{result['eps']:.5e}",
                     "no_cross": str(bool(result["no_cross"])),
                     "no_touch": str(bool(result["no_touch"])),
                     "rough_line": f"{result['rough_reference_m']:.6e} * E + {result['rough_reference_b']:.6e}",
                     "apex_distance": f"{result['apex_max_distance']:.6e}",
-                    "poly_degree": str(result["zero_line_poly_degree"]),
+                    "poly_degree": f"{result['zero_line_selected_degree']} (actual order {result['zero_line_poly_degree']})",
+                    "selected_degree_r2": f"{result['zero_line_selected_degree_r2']:.6f}",
+                    "best_degree": f"{result['zero_line_best_degree']} (R² {result['zero_line_best_degree_r2']:.6f})",
+                    "best_degree_r2": f"{result['zero_line_best_degree_r2']:.6f}",
+                    "outer_smooth_sigma": f"{result['outer_smooth_sigma']:.2f}",
                     "coefficients": np.array2string(result["zero_line_coeffs"], precision=6, separator=", "),
                     "polynomial_expression": format_polynomial(result["zero_line_coeffs"], precision=4),
                     "delta_shift": f"{result['zero_line_delta_shift']:.6e}",
@@ -779,7 +807,9 @@ def index():
         error=error,
         form=form,
         fixed_sigma=FIXED_SMOOTH_SIGMA,
+        fixed_outer_sigma=FIXED_OUTER_REF_SMOOTH_SIGMA,
         fixed_deriv_win=FIXED_DERIV_SMOOTH_WIN,
+        poly_degree_options=POLY_DEGREE_OPTIONS,
         upload_id=upload_id,
         numeric_cols=numeric_cols,
         preview_html=preview_html,

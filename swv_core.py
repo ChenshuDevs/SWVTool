@@ -15,6 +15,8 @@ import pandas as pd
 
 FIXED_SMOOTH_SIGMA = 1
 FIXED_DERIV_SMOOTH_WIN = 9
+FIXED_OUTER_REF_SMOOTH_SIGMA = 2
+POLY_DEGREE_OPTIONS = (1, 2, 3)
 
 
 def gaussian_smooth(y, sigma_pts=1):
@@ -193,48 +195,158 @@ def build_reference_mask_from_peak_bounds(n, left_idx, right_idx):
     return ref_mask
 
 
-def fit_zero_line_from_outer_points(E, I, ref_mask, peak_orientation="downward", poly_degree=2, eps=None):
+def smooth_outer_reference_regions(I, left_idx, right_idx, sigma_pts=FIXED_OUTER_REF_SMOOTH_SIGMA):
+    I = np.asarray(I, dtype=float)
+    smoothed = I.copy()
+
+    if left_idx > 1:
+        smoothed[:left_idx] = gaussian_smooth(I[:left_idx], sigma_pts=sigma_pts)
+    if right_idx + 2 < len(I):
+        smoothed[right_idx + 1:] = gaussian_smooth(I[right_idx + 1:], sigma_pts=sigma_pts)
+
+    return smoothed
+
+
+def build_zeroing_signal(I_peak_smoothed, I_outer_smoothed, left_idx, right_idx):
+    I_zeroing = np.asarray(I_outer_smoothed, dtype=float).copy()
+    I_zeroing[left_idx:right_idx + 1] = np.asarray(I_peak_smoothed, dtype=float)[left_idx:right_idx + 1]
+    return I_zeroing
+
+
+def _compute_r2(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    if ss_tot < 1e-20:
+        return 1.0 if ss_res < 1e-20 else 0.0
+    return 1.0 - ss_res / ss_tot
+
+
+def select_best_polynomial_degree(E_ref, I_ref, allowed_degrees=POLY_DEGREE_OPTIONS):
+    candidates = []
+    for requested_degree in allowed_degrees:
+        actual_degree = max(1, min(int(requested_degree), len(E_ref) - 1))
+        coeffs = np.polyfit(E_ref, I_ref, actual_degree)
+        fit_ref = np.polyval(coeffs, E_ref)
+        r2 = _compute_r2(I_ref, fit_ref)
+        candidates.append(
+            {
+                "requested_degree": int(requested_degree),
+                "actual_degree": actual_degree,
+                "coeffs": coeffs,
+                "r2": r2,
+            }
+        )
+
+    best = max(candidates, key=lambda item: (item["r2"], -item["actual_degree"]))
+    return best, candidates
+
+
+def fit_zero_line_from_outer_points(
+    E,
+    I_fit_source,
+    I_zeroing_source,
+    ref_mask,
+    fit_guard_mask,
+    peak_orientation="downward",
+    eps=None,
+    poly_degree=2,
+):
     _validate_peak_orientation(peak_orientation)
     E = np.asarray(E)
-    I = np.asarray(I)
+    I_fit_source = np.asarray(I_fit_source)
+    I_zeroing_source = np.asarray(I_zeroing_source)
 
     if not np.any(ref_mask):
         raise ValueError("No valid outer reference points for zero-line fitting.")
+    if not np.any(fit_guard_mask):
+        raise ValueError("No valid peak-region points for zero-line guarding.")
 
     if eps is None:
-        resid0 = I - gaussian_smooth(I, sigma_pts=4)
+        resid0 = I_fit_source - gaussian_smooth(I_fit_source, sigma_pts=4)
         noise_est = np.median(np.abs(resid0 - np.median(resid0))) * 1.4826
-        eps = max(3 * noise_est, 1e-4)
+        eps = max(3 * noise_est, 1e-10)
 
     E_ref = E[ref_mask]
-    I_ref = I[ref_mask]
+    I_ref = I_fit_source[ref_mask]
 
-    max_degree = max(1, min(int(poly_degree), len(E_ref) - 1))
-    coeffs = np.polyfit(E_ref, I_ref, max_degree)
+    best_degree_info, degree_candidates = select_best_polynomial_degree(E_ref, I_ref)
+
+    if poly_degree in (None, "auto"):
+        selected_degree_info = best_degree_info
+    else:
+        requested_degree = int(poly_degree)
+        selected_degree_info = next(
+            (candidate for candidate in degree_candidates if candidate["requested_degree"] == requested_degree),
+            None,
+        )
+        if selected_degree_info is None:
+            actual_degree = max(1, min(requested_degree, len(E_ref) - 1))
+            coeffs = np.polyfit(E_ref, I_ref, actual_degree)
+            selected_degree_info = {
+                "requested_degree": requested_degree,
+                "actual_degree": actual_degree,
+                "coeffs": coeffs,
+                "r2": _compute_r2(I_ref, np.polyval(coeffs, E_ref)),
+            }
+
+    max_degree = selected_degree_info["actual_degree"]
+    coeffs = selected_degree_info["coeffs"]
     fit_curve = np.polyval(coeffs, E)
+    I_guard = I_zeroing_source[fit_guard_mask]
+    fit_guard = fit_curve[fit_guard_mask]
+    I_outer = I_zeroing_source[ref_mask]
+    fit_outer = fit_curve[ref_mask]
 
     if peak_orientation == "downward":
-        delta_shift = np.max(I + eps - fit_curve)
+        peak_required_shift = float(np.max(I_guard + eps - fit_guard))
+        outer_required_shift = float(np.max(I_outer - fit_outer))
+        delta_shift = max(0.0, peak_required_shift, outer_required_shift)
         zero_line = fit_curve + delta_shift
-        gap_to_raw = zero_line - I
+        gap_to_zeroing = zero_line - I_zeroing_source
     else:
-        delta_shift = np.min(I - eps - fit_curve)
+        peak_required_shift = float(np.min(I_guard - eps - fit_guard))
+        outer_required_shift = float(np.min(I_outer - fit_outer))
+        delta_shift = min(0.0, peak_required_shift, outer_required_shift)
         zero_line = fit_curve + delta_shift
-        gap_to_raw = I - zero_line
+        gap_to_zeroing = I_zeroing_source - zero_line
+
+    outer_zero_error = np.abs(gap_to_zeroing[ref_mask])
+    guard_gap = gap_to_zeroing[fit_guard_mask]
 
     return {
         "coeffs": coeffs,
+        "selected_degree": selected_degree_info["requested_degree"],
         "poly_degree": max_degree,
+        "selected_degree_r2": float(selected_degree_info["r2"]),
+        "best_degree": int(best_degree_info["requested_degree"]),
+        "best_degree_actual": int(best_degree_info["actual_degree"]),
+        "best_degree_r2": float(best_degree_info["r2"]),
+        "degree_candidates": degree_candidates,
         "fit_curve": fit_curve,
         "delta_shift": delta_shift,
         "zero_line": zero_line,
         "eps": eps,
-        "min_gap": np.min(gap_to_raw),
-        "gap_to_raw": gap_to_raw,
+        "min_gap": np.min(gap_to_zeroing),
+        "min_guard_gap": np.min(guard_gap),
+        "min_outer_gap": float(np.min(gap_to_zeroing[ref_mask])),
+        "outer_mean_abs_error": float(np.mean(outer_zero_error)),
+        "outer_max_abs_error": float(np.max(outer_zero_error)),
+        "gap_to_zeroing": gap_to_zeroing,
     }
 
 
-def swv_workflow(E, I, peak_left_bound, peak_right_bound, peak_orientation="downward", eps=None, poly_degree=2):
+def swv_workflow(
+    E,
+    I,
+    peak_left_bound,
+    peak_right_bound,
+    peak_orientation="downward",
+    eps=None,
+    poly_degree="auto",
+    outer_smooth_sigma=FIXED_OUTER_REF_SMOOTH_SIGMA,
+):
     _validate_peak_orientation(peak_orientation)
     peak = find_peak_in_bounds(
         E,
@@ -249,25 +361,44 @@ def swv_workflow(E, I, peak_left_bound, peak_right_bound, peak_orientation="down
         left_idx=peak["left_idx"],
         right_idx=peak["right_idx"],
     )
+    peak_mask = ~ref_mask
+
+    I_outer_smoothed = smooth_outer_reference_regions(
+        I,
+        left_idx=peak["left_idx"],
+        right_idx=peak["right_idx"],
+        sigma_pts=outer_smooth_sigma,
+    )
+    I_zeroing = build_zeroing_signal(
+        peak["smooth"],
+        I_outer_smoothed,
+        left_idx=peak["left_idx"],
+        right_idx=peak["right_idx"],
+    )
 
     zero_fit = fit_zero_line_from_outer_points(
         E,
-        I,
+        I_fit_source=I_outer_smoothed,
+        I_zeroing_source=I_zeroing,
         ref_mask=ref_mask,
+        fit_guard_mask=peak_mask,
         peak_orientation=peak_orientation,
         poly_degree=poly_degree,
         eps=eps,
     )
 
     if peak_orientation == "downward":
-        corrected = zero_fit["zero_line"] - I
+        corrected = zero_fit["zero_line"] - I_zeroing
     else:
-        corrected = I - zero_fit["zero_line"]
+        corrected = I_zeroing - zero_fit["zero_line"]
 
     return {
         "E": E,
         "I_raw": I,
         "I_smooth": peak["smooth"],
+        "I_outer_smoothed": I_outer_smoothed,
+        "I_zeroing": I_zeroing,
+        "outer_smooth_sigma": outer_smooth_sigma,
         "peak_orientation": peak_orientation,
         "apex_idx": peak["apex_idx"],
         "left_idx": peak["left_idx"],
@@ -282,20 +413,31 @@ def swv_workflow(E, I, peak_left_bound, peak_right_bound, peak_orientation="down
         "apex_distance_curve": peak["apex_distance_curve"],
         "apex_max_distance": peak["apex_max_distance"],
         "ref_mask": ref_mask,
+        "peak_mask": peak_mask,
         "zero_line": zero_fit["zero_line"],
         "zero_line_fit_curve": zero_fit["fit_curve"],
         "zero_line_coeffs": zero_fit["coeffs"],
+        "zero_line_selected_degree": zero_fit["selected_degree"],
         "zero_line_poly_degree": zero_fit["poly_degree"],
+        "zero_line_selected_degree_r2": zero_fit["selected_degree_r2"],
+        "zero_line_best_degree": zero_fit["best_degree"],
+        "zero_line_best_degree_actual": zero_fit["best_degree_actual"],
+        "zero_line_best_degree_r2": zero_fit["best_degree_r2"],
+        "zero_line_degree_candidates": zero_fit["degree_candidates"],
         "zero_line_delta_shift": zero_fit["delta_shift"],
-        "gap_to_raw": zero_fit["gap_to_raw"],
+        "gap_to_zeroing": zero_fit["gap_to_zeroing"],
         "eps": zero_fit["eps"],
         "min_gap": zero_fit["min_gap"],
+        "min_guard_gap": zero_fit["min_guard_gap"],
+        "min_outer_gap": zero_fit["min_outer_gap"],
+        "outer_mean_abs_error": zero_fit["outer_mean_abs_error"],
+        "outer_max_abs_error": zero_fit["outer_max_abs_error"],
         "corrected": corrected,
-        "no_cross": np.all(zero_fit["gap_to_raw"] > -1e-12),
-        "no_touch": np.min(zero_fit["gap_to_raw"]) > 0,
+        "no_cross": np.all(zero_fit["gap_to_zeroing"][peak_mask] > -1e-12),
+        "no_touch": np.min(zero_fit["gap_to_zeroing"][peak_mask]) > 0,
     }
 
-def swv_downward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree=2):
+def swv_downward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree="auto", outer_smooth_sigma=FIXED_OUTER_REF_SMOOTH_SIGMA):
     return swv_workflow(
         E,
         I,
@@ -304,10 +446,11 @@ def swv_downward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, pol
         peak_orientation="downward",
         eps=eps,
         poly_degree=poly_degree,
+        outer_smooth_sigma=outer_smooth_sigma,
     )
 
 
-def swv_upward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree=2):
+def swv_upward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree="auto", outer_smooth_sigma=FIXED_OUTER_REF_SMOOTH_SIGMA):
     return swv_workflow(
         E,
         I,
@@ -316,6 +459,7 @@ def swv_upward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_
         peak_orientation="upward",
         eps=eps,
         poly_degree=poly_degree,
+        outer_smooth_sigma=outer_smooth_sigma,
     )
 
 
@@ -348,13 +492,14 @@ def make_plot_step2(E, I, Is, ref_mask, left_idx, apex_idx, right_idx, search_st
     return fig
 
 
-def make_plot_zero_line(E, I, fit_curve, zero_line, ref_mask, left_idx, apex_idx, right_idx):
+def make_plot_zero_line(E, I, I_outer_smoothed, fit_curve, zero_line, ref_mask, left_idx, apex_idx, right_idx):
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(E, I * 1e6, label="Raw SWV")
+    ax.plot(E, I_outer_smoothed * 1e6, alpha=0.75, label="Outer-only smoothed reference")
     ax.plot(E, fit_curve * 1e6, label="Polynomial fit")
     ax.plot(E, zero_line * 1e6, label="Final zero line")
     if np.any(ref_mask):
-        ax.scatter(E[ref_mask], (I * 1e6)[ref_mask], s=14, label="Outer points")
+        ax.scatter(E[ref_mask], (I_outer_smoothed * 1e6)[ref_mask], s=14, label="Smoothed outer points")
     ax.axvline(E[left_idx], linestyle="--", label="Left boundary")
     ax.axvline(E[apex_idx], linestyle="--", label="Apex")
     ax.axvline(E[right_idx], linestyle="--", label="Right boundary")
@@ -374,7 +519,7 @@ def make_plot_corrected(E, corrected, left_idx, right_idx):
     ax.axvline(E[right_idx], linestyle="--")
     ax.set_xlabel("Potential")
     ax.set_ylabel("Zero-line-relative current (uA)")
-    ax.set_title("Step 4 - Curve relative to zero line")
+    ax.set_title("Step 4 - Smoothed curve relative to zero line")
     ax.legend()
     fig.tight_layout()
     return fig
@@ -388,6 +533,10 @@ def build_output_dataframe(result):
             "Current_raw_uA": result["I_raw"] * 1e6,
             "Current_smoothed_A": result["I_smooth"],
             "Current_smoothed_uA": result["I_smooth"] * 1e6,
+            "Current_outer_reference_smoothed_A": result["I_outer_smoothed"],
+            "Current_outer_reference_smoothed_uA": result["I_outer_smoothed"] * 1e6,
+            "Current_zeroing_source_A": result["I_zeroing"],
+            "Current_zeroing_source_uA": result["I_zeroing"] * 1e6,
             "Zero_line_fit_curve_A": result["zero_line_fit_curve"],
             "Zero_line_fit_curve_uA": result["zero_line_fit_curve"] * 1e6,
             "Zero_line_final_A": result["zero_line"],
