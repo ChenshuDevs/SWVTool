@@ -18,7 +18,7 @@ from swv_core import (
     make_plot_raw,
     make_plot_step2,
     make_plot_zero_line,
-    swv_downward_workflow,
+    swv_workflow,
 )
 
 
@@ -36,7 +36,7 @@ TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SWV Downward-Peak Baseline Correction</title>
+  <title>SWV Peak Baseline Correction</title>
   <style>
     :root {
       --bg: #f6f4ef;
@@ -141,6 +141,49 @@ TEMPLATE = """
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
       gap: 16px;
     }
+    .selector-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      padding: 12px;
+    }
+    .selector-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    .selector-toolbar button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      padding: 8px 12px;
+      cursor: pointer;
+      color: var(--ink);
+    }
+    .selector-toolbar button.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .selector-wrap {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+      background: linear-gradient(180deg, #fff 0%, #faf6ee 100%);
+    }
+    .selector-wrap svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      cursor: crosshair;
+    }
+    .selector-meta {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
     .plot-card img {
       width: 100%;
       display: block;
@@ -181,8 +224,8 @@ TEMPLATE = """
 <body>
   <div class="shell">
     <section class="hero">
-      <h1>SWV Downward-Peak Baseline Correction Tool</h1>
-      <p>Self-contained local web app for the existing SWV workflow. Upload CSV or Excel, choose the potential/current columns, tune the peak-search parameters, and export the corrected dataset without Streamlit.</p>
+      <h1>SWV Peak Baseline Correction Tool</h1>
+      <p>Self-contained local web app for the existing SWV workflow. Upload CSV or Excel, choose the potential/current columns, choose the peak orientation, define the desired peak bounds from the raw data, and export the corrected dataset without Streamlit.</p>
       <p class="hint">Fixed smoothing sigma: <strong>{{ fixed_sigma }}</strong> | Fixed detrended smoothing window: <strong>{{ fixed_deriv_win }}</strong></p>
     </section>
 
@@ -198,6 +241,13 @@ TEMPLATE = """
             <input id="data_file" type="file" name="data_file" accept=".csv,.xlsx,.xls">
           </div>
           {% if numeric_cols %}
+            <div>
+              <label for="peak_orientation">Peak orientation</label>
+              <select id="peak_orientation" name="peak_orientation">
+                <option value="downward" {% if form.peak_orientation == "downward" %}selected{% endif %}>Concaving up / pointing downward</option>
+                <option value="upward" {% if form.peak_orientation == "upward" %}selected{% endif %}>Concaving down / pointing upward</option>
+              </select>
+            </div>
             <div>
               <label for="x_col">Potential column</label>
               <select id="x_col" name="x_col">
@@ -217,12 +267,12 @@ TEMPLATE = """
           {% endif %}
           <div class="two-col">
             <div>
-              <label for="fallback_frac">Boundary amplitude-drop fraction</label>
-              <input id="fallback_frac" type="number" min="0.01" max="0.30" step="0.01" name="fallback_frac" value="{{ form.fallback_frac }}">
+              <label for="peak_left_bound">Peak left bound (Potential)</label>
+              <input id="peak_left_bound" type="number" step="any" name="peak_left_bound" value="{{ form.peak_left_bound }}">
             </div>
             <div>
-              <label for="edge_exclusion_frac">Edge exclusion fraction</label>
-              <input id="edge_exclusion_frac" type="number" min="0.00" max="0.25" step="0.01" name="edge_exclusion_frac" value="{{ form.edge_exclusion_frac }}">
+              <label for="peak_right_bound">Peak right bound (Potential)</label>
+              <input id="peak_right_bound" type="number" step="any" name="peak_right_bound" value="{{ form.peak_right_bound }}">
             </div>
           </div>
           <div class="two-col">
@@ -244,13 +294,32 @@ TEMPLATE = """
             <label><input type="checkbox" name="sort_x" value="1" {% if form.sort_x %}checked{% endif %}>Sort by potential</label>
             <label><input type="checkbox" name="drop_na" value="1" {% if form.drop_na %}checked{% endif %}>Drop NaN rows</label>
           </div>
-          <button class="button" type="submit">Run Analysis</button>
+          <button class="button secondary" type="submit" name="action" value="load">Load Data</button>
+          {% if selector_data %}
+            <button class="button" type="submit" name="action" value="analyze">Run Analysis</button>
+          {% endif %}
         </form>
-        <p class="hint" style="margin-top:14px;">If a file is already loaded, you can change parameters and rerun without uploading again.</p>
+        <p class="hint" style="margin-top:14px;">Load a file first. After that, you can click on the raw trace to set the left and right peak bounds, then run the analysis.</p>
       </section>
 
       <main class="stack">
         {% if preview_html %}
+          <section class="panel">
+            <h2>Peak Window Selection</h2>
+            <p class="muted">Choose whether your next click sets the left or right bound, then click directly on the raw trace. The numeric inputs update automatically and you can still edit them manually.</p>
+            <div class="selector-card">
+              <div class="selector-toolbar">
+                <button type="button" id="pick-left" class="active">Next click sets left bound</button>
+                <button type="button" id="pick-right">Next click sets right bound</button>
+                <button type="button" id="clear-bounds">Clear bounds</button>
+              </div>
+              <div class="selector-wrap">
+                <svg id="raw-selector" viewBox="0 0 900 320" preserveAspectRatio="none" aria-label="Raw data selector"></svg>
+              </div>
+              <div class="selector-meta" id="selector-meta">Click on the chart to place the current bound.</div>
+            </div>
+          </section>
+
           <section class="panel">
             <h2>Preview</h2>
             <div class="table-wrap">{{ preview_html|safe }}</div>
@@ -264,6 +333,8 @@ TEMPLATE = """
               <div class="metric"><div class="k">Left Boundary</div><div class="v">{{ result.left_boundary }}</div></div>
               <div class="metric"><div class="k">Apex</div><div class="v">{{ result.apex }}</div></div>
               <div class="metric"><div class="k">Right Boundary</div><div class="v">{{ result.right_boundary }}</div></div>
+              <div class="metric"><div class="k">Requested Window</div><div class="v">{{ result.requested_window }}</div></div>
+              <div class="metric"><div class="k">Peak Orientation</div><div class="v">{{ result.peak_orientation }}</div></div>
               <div class="metric"><div class="k">Min Gap</div><div class="v">{{ result.min_gap }}</div></div>
               <div class="metric"><div class="k">Safety Margin ε</div><div class="v">{{ result.eps }}</div></div>
               <div class="metric"><div class="k">No Cross</div><div class="v">{{ result.no_cross }}</div></div>
@@ -288,7 +359,7 @@ TEMPLATE = """
 
           <section class="panel">
             <h2>Fit Details</h2>
-            <p><strong>Rough apex-detection line:</strong> <code>y = {{ result.rough_line }}</code></p>
+            <p><strong>Rough apex-detection reference line:</strong> <code>y = {{ result.rough_line }}</code></p>
             <p><strong>Max orthogonal distance:</strong> <code>{{ result.apex_distance }}</code></p>
             <p><strong>Polynomial degree:</strong> <code>{{ result.poly_degree }}</code></p>
             <p><strong>Polynomial coefficients:</strong> <code>{{ result.coefficients }}</code></p>
@@ -305,12 +376,11 @@ TEMPLATE = """
           <section class="panel">
             <h2>Workflow</h2>
             <p>1. Smooth the SWV trace with fixed sigma = 1.</p>
-            <p>2. Exclude edge regions from apex search.</p>
-            <p>3. Fit a rough upper line in the middle region.</p>
-            <p>4. Pick the apex by maximum orthogonal distance below that line.</p>
-            <p>5. Detect left and right boundaries from detrended curvature plus amplitude drop.</p>
-            <p>6. Fit a polynomial zero line using only the local outer points.</p>
-            <p>7. Shift the polynomial upward to satisfy no-cross and no-touch.</p>
+            <p>2. Use the user-supplied left and right bounds to define the target peak window on the raw data.</p>
+            <p>3. Fit a rough upper or lower reference line inside that window based on the selected peak orientation.</p>
+            <p>4. Pick the apex by maximum orthogonal distance away from that reference line.</p>
+            <p>5. Fit a polynomial zero line using points outside the selected peak window.</p>
+            <p>6. Shift the polynomial toward the non-peak side to satisfy no-cross and no-touch.</p>
             <p>8. Export the zero-line-relative corrected curve.</p>
           </section>
         {% endif %}
@@ -318,6 +388,155 @@ TEMPLATE = """
     </div>
   </div>
 </body>
+{% if selector_data %}
+<script>
+(() => {
+  const selectorData = {{ selector_data | tojson }};
+  const svg = document.getElementById("raw-selector");
+  const leftInput = document.getElementById("peak_left_bound");
+  const rightInput = document.getElementById("peak_right_bound");
+  const pickLeftButton = document.getElementById("pick-left");
+  const pickRightButton = document.getElementById("pick-right");
+  const clearButton = document.getElementById("clear-bounds");
+  const meta = document.getElementById("selector-meta");
+  if (!svg || !leftInput || !rightInput) return;
+
+  const width = 900;
+  const height = 320;
+  const padding = { left: 56, right: 24, top: 18, bottom: 34 };
+  const potentials = selectorData.potentials;
+  const currents = selectorData.currents_uA;
+  const xMin = selectorData.x_min;
+  const xMax = selectorData.x_max;
+  const yMin = selectorData.y_min;
+  const yMax = selectorData.y_max;
+  let target = "left";
+
+  function setTarget(nextTarget) {
+    target = nextTarget;
+    pickLeftButton.classList.toggle("active", target === "left");
+    pickRightButton.classList.toggle("active", target === "right");
+    meta.textContent = target === "left"
+      ? "Next click will update the left bound."
+      : "Next click will update the right bound.";
+  }
+
+  function xScale(value) {
+    return padding.left + ((value - xMin) / (xMax - xMin || 1)) * (width - padding.left - padding.right);
+  }
+
+  function yScale(value) {
+    return height - padding.bottom - ((value - yMin) / (yMax - yMin || 1)) * (height - padding.top - padding.bottom);
+  }
+
+  function nearestPotential(clientX) {
+    const rect = svg.getBoundingClientRect();
+    const ratio = (clientX - rect.left) / rect.width;
+    const dataX = xMin + Math.max(0, Math.min(1, ratio)) * (xMax - xMin);
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < potentials.length; i += 1) {
+      const dist = Math.abs(potentials[i] - dataX);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    return Number(potentials[bestIdx].toFixed(5));
+  }
+
+  function render() {
+    svg.innerHTML = "";
+
+    const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    bg.setAttribute("x", "0");
+    bg.setAttribute("y", "0");
+    bg.setAttribute("width", String(width));
+    bg.setAttribute("height", String(height));
+    bg.setAttribute("fill", "#fffdf8");
+    svg.appendChild(bg);
+
+    const axisColor = "#7b877f";
+    const lineColor = "#0e6b62";
+    const boundColor = "#d97a2b";
+
+    const xAxis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    xAxis.setAttribute("x1", String(padding.left));
+    xAxis.setAttribute("x2", String(width - padding.right));
+    xAxis.setAttribute("y1", String(height - padding.bottom));
+    xAxis.setAttribute("y2", String(height - padding.bottom));
+    xAxis.setAttribute("stroke", axisColor);
+    svg.appendChild(xAxis);
+
+    const yAxis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    yAxis.setAttribute("x1", String(padding.left));
+    yAxis.setAttribute("x2", String(padding.left));
+    yAxis.setAttribute("y1", String(padding.top));
+    yAxis.setAttribute("y2", String(height - padding.bottom));
+    yAxis.setAttribute("stroke", axisColor);
+    svg.appendChild(yAxis);
+
+    const points = potentials.map((x, idx) => `${xScale(x)},${yScale(currents[idx])}`).join(" ");
+    const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", lineColor);
+    polyline.setAttribute("stroke-width", "2");
+    polyline.setAttribute("points", points);
+    svg.appendChild(polyline);
+
+    const leftValue = leftInput.value === "" ? null : Number(leftInput.value);
+    const rightValue = rightInput.value === "" ? null : Number(rightInput.value);
+    if (leftValue !== null && rightValue !== null && leftValue < rightValue) {
+      const shade = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      shade.setAttribute("x", String(xScale(leftValue)));
+      shade.setAttribute("y", String(padding.top));
+      shade.setAttribute("width", String(xScale(rightValue) - xScale(leftValue)));
+      shade.setAttribute("height", String(height - padding.top - padding.bottom));
+      shade.setAttribute("fill", "rgba(217,122,43,0.15)");
+      svg.appendChild(shade);
+    }
+
+    [leftValue, rightValue].forEach((value, idx) => {
+      if (value === null || Number.isNaN(value)) return;
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      marker.setAttribute("x1", String(xScale(value)));
+      marker.setAttribute("x2", String(xScale(value)));
+      marker.setAttribute("y1", String(padding.top));
+      marker.setAttribute("y2", String(height - padding.bottom));
+      marker.setAttribute("stroke", boundColor);
+      marker.setAttribute("stroke-width", "2");
+      marker.setAttribute("stroke-dasharray", idx === 0 ? "6 4" : "2 3");
+      svg.appendChild(marker);
+    });
+  }
+
+  svg.addEventListener("click", (event) => {
+    const value = nearestPotential(event.clientX);
+    if (target === "left") {
+      leftInput.value = value.toFixed(5);
+      setTarget("right");
+    } else {
+      rightInput.value = value.toFixed(5);
+      setTarget("left");
+    }
+    render();
+  });
+
+  pickLeftButton.addEventListener("click", () => setTarget("left"));
+  pickRightButton.addEventListener("click", () => setTarget("right"));
+  clearButton.addEventListener("click", () => {
+    leftInput.value = "";
+    rightInput.value = "";
+    render();
+    setTarget("left");
+  });
+  leftInput.addEventListener("input", render);
+  rightInput.addEventListener("input", render);
+
+  render();
+})();
+</script>
+{% endif %}
 </html>
 """
 
@@ -326,8 +545,9 @@ def _default_form_state():
     return {
         "x_col": "",
         "y_col": "",
-        "fallback_frac": "0.06",
-        "edge_exclusion_frac": "0.10",
+        "peak_orientation": "downward",
+        "peak_left_bound": "",
+        "peak_right_bound": "",
         "poly_degree": "2",
         "auto_eps": True,
         "manual_eps": "1e-6",
@@ -372,6 +592,23 @@ def _get_numeric_columns(df):
     return [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
 
 
+def _build_selector_data(E, I):
+    currents_uA = I * 1e6
+    y_min = float(np.min(currents_uA))
+    y_max = float(np.max(currents_uA))
+    if abs(y_max - y_min) < 1e-12:
+        y_min -= 1.0
+        y_max += 1.0
+    return {
+        "potentials": [float(x) for x in E],
+        "currents_uA": [float(y) for y in currents_uA],
+        "x_min": float(np.min(E)),
+        "x_max": float(np.max(E)),
+        "y_min": y_min,
+        "y_max": y_max,
+    }
+
+
 @app.get("/healthz")
 def healthcheck():
     return {"status": "ok"}, 200
@@ -389,14 +626,16 @@ def index():
     plots = []
     output_html = None
     download_url = None
+    selector_data = None
 
     if request.method == "POST":
         form.update(
             {
                 "x_col": request.form.get("x_col", ""),
                 "y_col": request.form.get("y_col", ""),
-                "fallback_frac": request.form.get("fallback_frac", form["fallback_frac"]),
-                "edge_exclusion_frac": request.form.get("edge_exclusion_frac", form["edge_exclusion_frac"]),
+                "peak_orientation": request.form.get("peak_orientation", form["peak_orientation"]),
+                "peak_left_bound": request.form.get("peak_left_bound", form["peak_left_bound"]),
+                "peak_right_bound": request.form.get("peak_right_bound", form["peak_right_bound"]),
                 "poly_degree": request.form.get("poly_degree", form["poly_degree"]),
                 "manual_eps": request.form.get("manual_eps", form["manual_eps"]),
                 "auto_eps": _bool_field("auto_eps"),
@@ -406,6 +645,7 @@ def index():
         )
 
         upload_id = request.form.get("upload_id", "")
+        action = request.form.get("action", "load")
         try:
             if "data_file" in request.files and request.files["data_file"].filename:
                 filename, df = _load_dataframe_from_upload(request.files["data_file"])
@@ -440,84 +680,93 @@ def index():
             if len(E) < 10:
                 raise ValueError("Too few valid points after filtering.")
 
-            fallback_frac = float(form["fallback_frac"])
-            edge_exclusion_frac = float(form["edge_exclusion_frac"])
-            poly_degree = int(form["poly_degree"])
-            eps = None if form["auto_eps"] else float(form["manual_eps"])
+            selector_data = _build_selector_data(E, I)
 
-            result = swv_downward_workflow(
-                E,
-                I,
-                fallback_frac=fallback_frac,
-                edge_exclusion_frac=edge_exclusion_frac,
-                eps=eps,
-                poly_degree=poly_degree,
-            )
+            if action == "analyze":
+                if form["peak_left_bound"] == "" or form["peak_right_bound"] == "":
+                    raise ValueError("Enter both peak left bound and peak right bound, or click them on the raw trace.")
 
-            out_df = build_output_dataframe(result)
-            download_id = uuid4().hex
-            OUTPUT_CACHE[download_id] = out_df.to_csv(index=False).encode("utf-8")
-            download_url = url_for("download_output", download_id=download_id)
-            output_html = _dataframe_preview_html(out_df)
+                peak_left_bound = float(form["peak_left_bound"])
+                peak_right_bound = float(form["peak_right_bound"])
+                poly_degree = int(form["poly_degree"])
+                eps = None if form["auto_eps"] else float(form["manual_eps"])
 
-            plots = [
-                {"title": "1. Raw Data", "image": _encode_plot(make_plot_raw(E, I)), "note": None},
-                {
-                    "title": "2. Peak Detection",
-                    "image": _encode_plot(
-                        make_plot_step2(
-                            E,
-                            I,
-                            result["I_smooth"],
-                            result["ref_mask"],
-                            result["left_idx"],
-                            result["apex_idx"],
-                            result["right_idx"],
-                            result["search_start"],
-                            result["search_end"],
-                            result["rough_upper_line"],
-                        )
-                    ),
-                    "note": "Highlighted outer points are the reference points used for the final zero-line fit.",
-                },
-                {
-                    "title": "3. Zero Line",
-                    "image": _encode_plot(
-                        make_plot_zero_line(
-                            E,
-                            I,
-                            result["zero_line_fit_curve"],
-                            result["zero_line"],
-                            result["ref_mask"],
-                            result["left_idx"],
-                            result["apex_idx"],
-                            result["right_idx"],
-                        )
-                    ),
-                    "note": None,
-                },
-                {
-                    "title": "4. Relative Curve",
-                    "image": _encode_plot(make_plot_corrected(E, result["corrected"], result["left_idx"], result["right_idx"])),
-                    "note": None,
-                },
-            ]
+                result = swv_workflow(
+                    E,
+                    I,
+                    peak_left_bound=peak_left_bound,
+                    peak_right_bound=peak_right_bound,
+                    peak_orientation=form["peak_orientation"],
+                    eps=eps,
+                    poly_degree=poly_degree,
+                )
 
-            result_view = {
-                "left_boundary": f"{E[result['left_idx']]:.5f}",
-                "apex": f"{E[result['apex_idx']]:.5f}",
-                "right_boundary": f"{E[result['right_idx']]:.5f}",
-                "min_gap": f"{result['min_gap']:.5e}",
-                "eps": f"{result['eps']:.5e}",
-                "no_cross": str(bool(result["no_cross"])),
-                "no_touch": str(bool(result["no_touch"])),
-                "rough_line": f"{result['rough_upper_m']:.6e} * E + {result['rough_upper_b']:.6e}",
-                "apex_distance": f"{result['apex_max_distance']:.6e}",
-                "poly_degree": str(result["zero_line_poly_degree"]),
-                "coefficients": np.array2string(result["zero_line_coeffs"], precision=6, separator=", "),
-                "polynomial_expression": format_polynomial(result["zero_line_coeffs"], precision=4),
-                "delta_shift": f"{result['zero_line_delta_shift']:.6e}",
-            }
+                out_df = build_output_dataframe(result)
+                download_id = uuid4().hex
+                OUTPUT_CACHE[download_id] = out_df.to_csv(index=False).encode("utf-8")
+                download_url = url_for("download_output", download_id=download_id)
+                output_html = _dataframe_preview_html(out_df)
+
+                plots = [
+                    {"title": "1. Raw Data", "image": _encode_plot(make_plot_raw(E, I)), "note": None},
+                    {
+                        "title": "2. Peak Detection",
+                        "image": _encode_plot(
+                            make_plot_step2(
+                                E,
+                                I,
+                                result["I_smooth"],
+                                result["ref_mask"],
+                                result["left_idx"],
+                                result["apex_idx"],
+                                result["right_idx"],
+                                result["search_start"],
+                                result["search_end"],
+                                result["rough_reference_line"],
+                            )
+                        ),
+                        "note": "Points outside the selected peak window are used as the reference points for the final zero-line fit.",
+                    },
+                    {
+                        "title": "3. Zero Line",
+                        "image": _encode_plot(
+                            make_plot_zero_line(
+                                E,
+                                I,
+                                result["zero_line_fit_curve"],
+                                result["zero_line"],
+                                result["ref_mask"],
+                                result["left_idx"],
+                                result["apex_idx"],
+                                result["right_idx"],
+                            )
+                        ),
+                        "note": None,
+                    },
+                    {
+                        "title": "4. Relative Curve",
+                        "image": _encode_plot(make_plot_corrected(E, result["corrected"], result["left_idx"], result["right_idx"])),
+                        "note": None,
+                    },
+                ]
+
+                result_view = {
+                    "left_boundary": f"{E[result['left_idx']]:.5f}",
+                    "apex": f"{E[result['apex_idx']]:.5f}",
+                    "right_boundary": f"{E[result['right_idx']]:.5f}",
+                    "requested_window": f"{result['requested_left_bound']:.5f} to {result['requested_right_bound']:.5f}",
+                    "peak_orientation": "Concaving up / pointing downward" if result["peak_orientation"] == "downward" else "Concaving down / pointing upward",
+                    "min_gap": f"{result['min_gap']:.5e}",
+                    "eps": f"{result['eps']:.5e}",
+                    "no_cross": str(bool(result["no_cross"])),
+                    "no_touch": str(bool(result["no_touch"])),
+                    "rough_line": f"{result['rough_reference_m']:.6e} * E + {result['rough_reference_b']:.6e}",
+                    "apex_distance": f"{result['apex_max_distance']:.6e}",
+                    "poly_degree": str(result["zero_line_poly_degree"]),
+                    "coefficients": np.array2string(result["zero_line_coeffs"], precision=6, separator=", "),
+                    "polynomial_expression": format_polynomial(result["zero_line_coeffs"], precision=4),
+                    "delta_shift": f"{result['zero_line_delta_shift']:.6e}",
+                }
         except Exception as exc:
             error = str(exc)
             if upload_id in UPLOAD_CACHE:
@@ -534,6 +783,7 @@ def index():
         upload_id=upload_id,
         numeric_cols=numeric_cols,
         preview_html=preview_html,
+        selector_data=selector_data,
         result=result_view,
         plots=plots,
         output_html=output_html,
@@ -549,7 +799,7 @@ def download_output(download_id):
     return Response(
         csv_bytes,
         mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=swv_downward_corrected_output.csv"},
+        headers={"Content-Disposition": "attachment; filename=swv_corrected_output.csv"},
     )
 
 

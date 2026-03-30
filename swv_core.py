@@ -57,7 +57,12 @@ def format_polynomial(coeffs, precision=4):
     return " + ".join(terms) if terms else "0"
 
 
-def fit_upper_envelope_line(E, I, ref_mask=None, eps=None, n_slope=3501):
+def _validate_peak_orientation(peak_orientation):
+    if peak_orientation not in {"downward", "upward"}:
+        raise ValueError("peak_orientation must be either 'downward' or 'upward'.")
+
+
+def fit_envelope_line(E, I, mode="upper", ref_mask=None, eps=None, n_slope=3501):
     E = np.asarray(E)
     I = np.asarray(I)
 
@@ -78,9 +83,18 @@ def fit_upper_envelope_line(E, I, ref_mask=None, eps=None, n_slope=3501):
 
     best = None
     for m in m_grid:
-        b = np.max(I + eps - m * E)
-        score = np.mean(m * E_ref + b)
-        if best is None or score < best[0]:
+        if mode == "upper":
+            b = np.max(I + eps - m * E)
+            score = np.mean(m * E_ref + b)
+            is_better = best is None or score < best[0]
+        elif mode == "lower":
+            b = np.min(I - eps - m * E)
+            score = np.mean(m * E_ref + b)
+            is_better = best is None or score > best[0]
+        else:
+            raise ValueError("mode must be either 'upper' or 'lower'.")
+
+        if is_better:
             best = (score, m, b)
 
     _, m_best, b_best = best
@@ -88,21 +102,30 @@ def fit_upper_envelope_line(E, I, ref_mask=None, eps=None, n_slope=3501):
     return {"m": m_best, "b": b_best, "baseline": baseline}
 
 
-def fit_rough_upper_line_for_apex(E_region, I_region, n_slope=1201):
-    return fit_upper_envelope_line(
+def fit_rough_reference_line_for_apex(E_region, I_region, peak_orientation, n_slope=1201):
+    _validate_peak_orientation(peak_orientation)
+    mode = "upper" if peak_orientation == "downward" else "lower"
+    return fit_envelope_line(
         E_region,
         I_region,
+        mode=mode,
         ref_mask=np.ones_like(I_region, dtype=bool),
         eps=0.0,
         n_slope=n_slope,
     )
 
 
-def choose_apex_by_orthogonal_distance(E_region, I_region, rough_line):
+def choose_apex_by_orthogonal_distance(E_region, I_region, rough_line, peak_orientation):
+    _validate_peak_orientation(peak_orientation)
     m = rough_line["m"]
     b = rough_line["b"]
     denom = np.sqrt(m * m + 1.0)
-    distance = (m * E_region - I_region + b) / denom
+
+    if peak_orientation == "downward":
+        distance = (m * E_region - I_region + b) / denom
+    else:
+        distance = (I_region - m * E_region - b) / denom
+
     local_idx = int(np.argmax(distance))
     return {
         "local_idx": local_idx,
@@ -111,111 +134,67 @@ def choose_apex_by_orthogonal_distance(E_region, I_region, rough_line):
     }
 
 
-def find_boundaries_from_rough_line(E_region, Is_region, rough_line, apex_local_idx, amp_frac=0.10):
-    R_raw = rough_line - Is_region
-    R = moving_average(R_raw, win=FIXED_DERIV_SMOOTH_WIN)
-    d2 = second_derivative_nonuniform(E_region, R)
-
-    peak_amp = R[apex_local_idx]
-    amp_threshold = amp_frac * peak_amp
-
-    left_idx = 0
-    found_left = False
-    for i in range(apex_local_idx - 1, 1, -1):
-        cond_amp = R[i] <= amp_threshold
-        cond_curv = ((d2[i] <= 0 and d2[i - 1] > 0) or abs(d2[i]) < 1e-12)
-        if cond_amp and cond_curv:
-            left_idx = i
-            found_left = True
-            break
-    if not found_left:
-        left_candidates = np.where(R[:apex_local_idx] <= amp_threshold)[0]
-        left_idx = int(left_candidates[-1]) if len(left_candidates) > 0 else 0
-
-    right_idx = len(R) - 1
-    found_right = False
-    for i in range(apex_local_idx + 1, len(R) - 2):
-        cond_amp = R[i] <= amp_threshold
-        cond_curv = ((d2[i] <= 0 and d2[i + 1] > 0) or abs(d2[i]) < 1e-12)
-        if cond_amp and cond_curv:
-            right_idx = i
-            found_right = True
-            break
-    if not found_right:
-        right_candidates = np.where(R[apex_local_idx:] <= amp_threshold)[0]
-        right_idx = int(apex_local_idx + right_candidates[0]) if len(right_candidates) > 0 else len(R) - 1
-
-    return {
-        "R_raw": R_raw,
-        "R": R,
-        "d2": d2,
-        "left_local_idx": left_idx,
-        "right_local_idx": right_idx,
-    }
+def _find_closest_index(E, target):
+    return int(np.argmin(np.abs(E - target)))
 
 
-def find_main_downward_peak_window(E, I, fallback_frac=0.08, edge_exclusion_frac=0.08):
+def find_peak_in_bounds(E, I, left_bound, right_bound, peak_orientation="downward"):
+    _validate_peak_orientation(peak_orientation)
     Is = gaussian_smooth(I, sigma_pts=FIXED_SMOOTH_SIGMA)
-    n = len(Is)
+    left_bound = float(left_bound)
+    right_bound = float(right_bound)
+    if left_bound >= right_bound:
+        raise ValueError("Peak left bound must be smaller than peak right bound.")
 
-    edge_n = int(np.floor(edge_exclusion_frac * n))
-    edge_n = max(0, min(edge_n, max(0, n // 2 - 2)))
+    if left_bound < np.min(E) or right_bound > np.max(E):
+        raise ValueError("Peak bounds must lie within the Potential range of the dataset.")
 
-    search_start = edge_n
-    search_end = n - edge_n
-    if search_end - search_start < 5:
-        search_start = 0
-        search_end = n
+    search_start = _find_closest_index(E, left_bound)
+    search_end_inclusive = _find_closest_index(E, right_bound)
+    if search_start >= search_end_inclusive:
+        raise ValueError("Peak bounds must span at least two distinct data points.")
+
+    search_end = search_end_inclusive + 1
+    if search_end - search_start < 3:
+        raise ValueError("Peak bounds are too narrow. Choose a wider interval around the desired peak.")
 
     E_region = E[search_start:search_end]
     I_region = Is[search_start:search_end]
 
-    rough = fit_rough_upper_line_for_apex(E_region, I_region, n_slope=1201)
-    apex_pick = choose_apex_by_orthogonal_distance(E_region, I_region, rough)
+    rough = fit_rough_reference_line_for_apex(E_region, I_region, peak_orientation=peak_orientation, n_slope=1201)
+    apex_pick = choose_apex_by_orthogonal_distance(E_region, I_region, rough, peak_orientation=peak_orientation)
     apex_local_idx = apex_pick["local_idx"]
     apex_idx = apex_local_idx + search_start
-
-    boundary = find_boundaries_from_rough_line(
-        E_region=E_region,
-        Is_region=I_region,
-        rough_line=rough["baseline"],
-        apex_local_idx=apex_local_idx,
-        amp_frac=fallback_frac,
-    )
-
-    left_idx = search_start + boundary["left_local_idx"]
-    right_idx = search_start + boundary["right_local_idx"]
-    left_idx = max(search_start, min(left_idx, apex_idx))
-    right_idx = min(search_end - 1, max(right_idx, apex_idx))
 
     return {
         "smooth": Is,
         "apex_idx": apex_idx,
-        "left_idx": left_idx,
-        "right_idx": right_idx,
+        "left_idx": search_start,
+        "right_idx": search_end - 1,
+        "requested_left_bound": left_bound,
+        "requested_right_bound": right_bound,
+        "peak_orientation": peak_orientation,
         "search_start": search_start,
         "search_end": search_end,
-        "rough_upper_line": rough["baseline"],
-        "rough_upper_m": rough["m"],
-        "rough_upper_b": rough["b"],
+        "rough_reference_line": rough["baseline"],
+        "rough_reference_m": rough["m"],
+        "rough_reference_b": rough["b"],
         "apex_distance_curve": apex_pick["distance"],
         "apex_max_distance": apex_pick["max_distance"],
-        "rough_detrended_signal_raw": boundary["R_raw"],
-        "rough_detrended_signal": boundary["R"],
-        "rough_detrended_d2": boundary["d2"],
     }
 
 
-def build_local_reference_mask(n, search_start, search_end, left_idx, right_idx):
+def build_reference_mask_from_peak_bounds(n, left_idx, right_idx):
     ref_mask = np.zeros(n, dtype=bool)
-    if left_idx > search_start:
-        ref_mask[search_start:left_idx] = True
-    if right_idx + 1 < search_end:
-        ref_mask[right_idx + 1:search_end] = True
+    if left_idx > 0:
+        ref_mask[:left_idx] = True
+    if right_idx + 1 < n:
+        ref_mask[right_idx + 1:] = True
     return ref_mask
 
 
-def fit_zero_line_from_outer_points(E, I, ref_mask, poly_degree=2, eps=None):
+def fit_zero_line_from_outer_points(E, I, ref_mask, peak_orientation="downward", poly_degree=2, eps=None):
+    _validate_peak_orientation(peak_orientation)
     E = np.asarray(E)
     I = np.asarray(I)
 
@@ -233,9 +212,15 @@ def fit_zero_line_from_outer_points(E, I, ref_mask, poly_degree=2, eps=None):
     max_degree = max(1, min(int(poly_degree), len(E_ref) - 1))
     coeffs = np.polyfit(E_ref, I_ref, max_degree)
     fit_curve = np.polyval(coeffs, E)
-    delta_shift = np.max(I + eps - fit_curve)
-    zero_line = fit_curve + delta_shift
-    min_gap = np.min(zero_line - I)
+
+    if peak_orientation == "downward":
+        delta_shift = np.max(I + eps - fit_curve)
+        zero_line = fit_curve + delta_shift
+        gap_to_raw = zero_line - I
+    else:
+        delta_shift = np.min(I - eps - fit_curve)
+        zero_line = fit_curve + delta_shift
+        gap_to_raw = I - zero_line
 
     return {
         "coeffs": coeffs,
@@ -244,22 +229,23 @@ def fit_zero_line_from_outer_points(E, I, ref_mask, poly_degree=2, eps=None):
         "delta_shift": delta_shift,
         "zero_line": zero_line,
         "eps": eps,
-        "min_gap": min_gap,
+        "min_gap": np.min(gap_to_raw),
+        "gap_to_raw": gap_to_raw,
     }
 
 
-def swv_downward_workflow(E, I, fallback_frac=0.08, edge_exclusion_frac=0.08, eps=None, poly_degree=2):
-    peak = find_main_downward_peak_window(
+def swv_workflow(E, I, peak_left_bound, peak_right_bound, peak_orientation="downward", eps=None, poly_degree=2):
+    _validate_peak_orientation(peak_orientation)
+    peak = find_peak_in_bounds(
         E,
         I,
-        fallback_frac=fallback_frac,
-        edge_exclusion_frac=edge_exclusion_frac,
+        left_bound=peak_left_bound,
+        right_bound=peak_right_bound,
+        peak_orientation=peak_orientation,
     )
 
-    ref_mask = build_local_reference_mask(
+    ref_mask = build_reference_mask_from_peak_bounds(
         n=len(I),
-        search_start=peak["search_start"],
-        search_end=peak["search_end"],
         left_idx=peak["left_idx"],
         right_idx=peak["right_idx"],
     )
@@ -268,41 +254,69 @@ def swv_downward_workflow(E, I, fallback_frac=0.08, edge_exclusion_frac=0.08, ep
         E,
         I,
         ref_mask=ref_mask,
+        peak_orientation=peak_orientation,
         poly_degree=poly_degree,
         eps=eps,
     )
 
-    corrected = zero_fit["zero_line"] - I
+    if peak_orientation == "downward":
+        corrected = zero_fit["zero_line"] - I
+    else:
+        corrected = I - zero_fit["zero_line"]
 
     return {
         "E": E,
         "I_raw": I,
         "I_smooth": peak["smooth"],
+        "peak_orientation": peak_orientation,
         "apex_idx": peak["apex_idx"],
         "left_idx": peak["left_idx"],
         "right_idx": peak["right_idx"],
+        "requested_left_bound": peak["requested_left_bound"],
+        "requested_right_bound": peak["requested_right_bound"],
         "search_start": peak["search_start"],
         "search_end": peak["search_end"],
-        "rough_upper_line": peak["rough_upper_line"],
-        "rough_upper_m": peak["rough_upper_m"],
-        "rough_upper_b": peak["rough_upper_b"],
+        "rough_reference_line": peak["rough_reference_line"],
+        "rough_reference_m": peak["rough_reference_m"],
+        "rough_reference_b": peak["rough_reference_b"],
         "apex_distance_curve": peak["apex_distance_curve"],
         "apex_max_distance": peak["apex_max_distance"],
-        "rough_detrended_signal_raw": peak["rough_detrended_signal_raw"],
-        "rough_detrended_signal": peak["rough_detrended_signal"],
-        "rough_detrended_d2": peak["rough_detrended_d2"],
         "ref_mask": ref_mask,
         "zero_line": zero_fit["zero_line"],
         "zero_line_fit_curve": zero_fit["fit_curve"],
         "zero_line_coeffs": zero_fit["coeffs"],
         "zero_line_poly_degree": zero_fit["poly_degree"],
         "zero_line_delta_shift": zero_fit["delta_shift"],
+        "gap_to_raw": zero_fit["gap_to_raw"],
         "eps": zero_fit["eps"],
         "min_gap": zero_fit["min_gap"],
         "corrected": corrected,
-        "no_cross": np.all(zero_fit["zero_line"] > I - 1e-12),
-        "no_touch": np.min(zero_fit["zero_line"] - I) > 0,
+        "no_cross": np.all(zero_fit["gap_to_raw"] > -1e-12),
+        "no_touch": np.min(zero_fit["gap_to_raw"]) > 0,
     }
+
+def swv_downward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree=2):
+    return swv_workflow(
+        E,
+        I,
+        peak_left_bound=peak_left_bound,
+        peak_right_bound=peak_right_bound,
+        peak_orientation="downward",
+        eps=eps,
+        poly_degree=poly_degree,
+    )
+
+
+def swv_upward_workflow(E, I, peak_left_bound, peak_right_bound, eps=None, poly_degree=2):
+    return swv_workflow(
+        E,
+        I,
+        peak_left_bound=peak_left_bound,
+        peak_right_bound=peak_right_bound,
+        peak_orientation="upward",
+        eps=eps,
+        poly_degree=poly_degree,
+    )
 
 
 def make_plot_raw(E, I):
