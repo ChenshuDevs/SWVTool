@@ -35,5 +35,3 @@ This repo includes [render.yaml](/Users/chenshudevs/Documents/SWV_tool/render.ya
 ### Important note
 
 The current app stores uploaded files and generated CSV outputs in memory (`UPLOAD_CACHE`, `OUTPUT_CACHE`). That is acceptable for a simple single-service deployment, but it is not durable storage. If the service restarts, cached uploads and downloads are lost.
-# SWVTool
-# SWVTool
