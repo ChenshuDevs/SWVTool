@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from flask import Flask, Response, redirect, render_template_string, request, url_for
+from flask import Flask, Response, redirect, render_template_string, request, session, url_for
 
 from swv_core import (
     FIXED_DERIV_SMOOTH_WIN,
@@ -242,6 +242,11 @@ TEMPLATE = """
             <label for="data_file">Upload CSV or Excel</label>
             <input id="data_file" type="file" name="data_file" accept=".csv,.xlsx,.xls">
           </div>
+          {% if loaded_filename %}
+            <p class="hint">Loaded file: <strong>{{ loaded_filename }}</strong></p>
+          {% else %}
+            <p class="hint">No file is currently loaded.</p>
+          {% endif %}
           {% if numeric_cols %}
             <div>
               <label for="peak_orientation">Peak orientation</label>
@@ -306,6 +311,7 @@ TEMPLATE = """
           <button class="button secondary" type="submit" name="action" value="load">Load Data</button>
           {% if selector_data %}
             <button class="button" type="submit" name="action" value="analyze">Run Analysis</button>
+            <button class="button secondary" type="submit" name="action" value="reset">Unload Data / Start Over</button>
           {% endif %}
         </form>
         <p class="hint" style="margin-top:14px;">Load a file first. After that, you can click on the raw trace to set the left and right peak bounds, then run the analysis.</p>
@@ -626,6 +632,22 @@ def _build_selector_data(E, I):
     }
 
 
+def _clear_upload_state(upload_id):
+    if upload_id:
+        UPLOAD_CACHE.pop(upload_id, None)
+
+
+def _clear_download_state(download_id):
+    if download_id:
+        OUTPUT_CACHE.pop(download_id, None)
+
+
+def _reset_session_state():
+    _clear_upload_state(session.pop("upload_id", None))
+    _clear_download_state(session.pop("download_id", None))
+    session.pop("loaded_filename", None)
+
+
 @app.get("/healthz")
 def healthcheck():
     return {"status": "ok"}, 200
@@ -633,6 +655,9 @@ def healthcheck():
 
 @app.route("/", methods=["GET", "POST"])
 def index():
+    if request.method == "GET":
+        _reset_session_state()
+
     error = None
     form = _default_form_state()
     upload_id = ""
@@ -644,6 +669,7 @@ def index():
     output_html = None
     download_url = None
     selector_data = None
+    loaded_filename = None
 
     if request.method == "POST":
         form.update(
@@ -662,17 +688,31 @@ def index():
             }
         )
 
-        upload_id = request.form.get("upload_id", "")
+        upload_id = request.form.get("upload_id", "") or session.get("upload_id", "")
         action = request.form.get("action", "load")
         try:
+            if action == "reset":
+                _reset_session_state()
+                return redirect(url_for("index"))
+
             if "data_file" in request.files and request.files["data_file"].filename:
+                _clear_upload_state(session.get("upload_id"))
+                _clear_download_state(session.get("download_id"))
                 filename, df = _load_dataframe_from_upload(request.files["data_file"])
                 upload_id = uuid4().hex
                 UPLOAD_CACHE[upload_id] = {"filename": filename, "df": df}
+                session["upload_id"] = upload_id
+                session["loaded_filename"] = filename
+                loaded_filename = filename
             elif upload_id in UPLOAD_CACHE:
-                df = UPLOAD_CACHE[upload_id]["df"]
+                cached = UPLOAD_CACHE[upload_id]
+                df = cached["df"]
+                loaded_filename = cached.get("filename")
             else:
                 raise ValueError("Upload a file to begin.")
+
+            if loaded_filename is None:
+                loaded_filename = session.get("loaded_filename")
 
             numeric_cols = _get_numeric_columns(df)
             if len(numeric_cols) < 2:
@@ -723,7 +763,9 @@ def index():
 
                 out_df = build_output_dataframe(result)
                 download_id = uuid4().hex
+                _clear_download_state(session.get("download_id"))
                 OUTPUT_CACHE[download_id] = out_df.to_csv(index=False).encode("utf-8")
+                session["download_id"] = download_id
                 download_url = url_for("download_output", download_id=download_id)
                 output_html = _dataframe_preview_html(out_df)
 
@@ -798,7 +840,9 @@ def index():
         except Exception as exc:
             error = str(exc)
             if upload_id in UPLOAD_CACHE:
-                df = UPLOAD_CACHE[upload_id]["df"]
+                cached = UPLOAD_CACHE[upload_id]
+                df = cached["df"]
+                loaded_filename = cached.get("filename")
                 numeric_cols = _get_numeric_columns(df)
                 preview_html = _dataframe_preview_html(df)
 
@@ -811,6 +855,7 @@ def index():
         fixed_deriv_win=FIXED_DERIV_SMOOTH_WIN,
         poly_degree_options=POLY_DEGREE_OPTIONS,
         upload_id=upload_id,
+        loaded_filename=loaded_filename,
         numeric_cols=numeric_cols,
         preview_html=preview_html,
         selector_data=selector_data,
